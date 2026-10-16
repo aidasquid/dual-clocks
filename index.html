@@ -1,0 +1,683 @@
+<!doctype html>
+<!-- 作成者: aidasquid (via Claude Code) / 作成日: 2026-10-16 / 説明: 「Dual Clocks」(二つの時間)の画面。物理は sim.js。2本の時間の軸の進み方を θ で回して解くパズル。 -->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dual Clocks</title>
+<style>
+  :root { --bg: #0d1017; --fg: #e8eaf0; --dim: #8a90a0; --t0: #4cc9f0; --t1: #f8961e; --me: #c77dff; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: "Hiragino Sans", "Yu Gothic UI", "Noto Sans JP", sans-serif; }
+  body { overflow: hidden; }
+  /* キャンバスは画面いっぱい。盤面は比を保って真ん中に描き、余る所には盤面の外のマスを続けて描く */
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; background: #121722; }
+  /* 面の名前・案内と操作の説明は、場所を取らないよう上と下に半透明で重ねる */
+  /* 文字の大きさは盤面の拡大率(--ui、resize で決める)に合わせる。小さいと気づかれないため */
+  #stage, #help { position: fixed; left: 50%; transform: translateX(-50%); max-width: min(calc(900px * var(--ui, 1)), calc(100vw - 32px)); box-sizing: border-box;
+    padding: calc(4px * var(--ui, 1)) calc(12px * var(--ui, 1)); border-radius: calc(8px * var(--ui, 1)); background: rgba(13,16,23,0.6);
+    font-size: calc(13px * var(--ui, 1)); color: var(--dim); line-height: 1.5; pointer-events: none; z-index: 2; }
+  #stage { top: calc(8px * var(--ui, 1)); text-align: left; transform: none; } /* 左右の位置と幅は placeStageBar で、計器と7セグを避けて決める */
+  #stage:empty, #stage.empty { display: none; }
+  #stage b { color: var(--fg); font-size: calc(15px * var(--ui, 1)); margin-right: 10px; }
+  #help { bottom: calc(8px * var(--ui, 1)); text-align: center; font-size: calc(12px * var(--ui, 1)); }
+  #help b { color: var(--fg); font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="stage"><b id="sname"></b><span id="shint"></span></div>
+<canvas id="c" width="960" height="576"></canvas>
+<div id="help"><b>A / D</b> 移動 · <b>W / スペース</b> ジャンプ · <b>ホイール</b>(または <b>Q / E</b>) θ を回す(上で t₁ 側) · <b>S</b> ボタン · <b>Shift</b> 細かく回す · <b>R</b> やり直し · <b>1〜7</b> 面を選ぶ · <b>N</b> 次の面 · <b>Esc</b> タイトルへ</div>
+<script src="sim.js"></script>
+<script>
+'use strict';
+const { TS, COLS, ROWS, STAGES, createWorld, step, observed, tileAt, stepOutsideFast } = TwoTime;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+// 盤面の大きさ(論理の座標)。画面の大きさに合わせて、比を保ったまま拡大して真ん中に描く
+const VW = COLS * TS, VH = ROWS * TS;
+const view = { s: 1, ox: 0, oy: 0 };
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(innerWidth * dpr); cv.height = Math.round(innerHeight * dpr);
+  view.s = Math.min(cv.width / VW, cv.height / VH);
+  view.ox = (cv.width - VW * view.s) / 2; view.oy = (cv.height - VH * view.s) / 2;
+  document.documentElement.style.setProperty('--ui', String(Math.max(1, view.s / dpr))); // 上下の文字の拡大率
+  placeStageBar();
+}
+// 上の帯(面の名前と案内)は、左上の計器の右隣から、右上の7セグ(面7)の手前までに置く
+function placeStageBar() {
+  const el = document.getElementById('stage'); if (!el) return;
+  const dpr = window.devicePixelRatio || 1;
+  let hasSeg = false; // 面7(7セグがある)か。ページを開いた直後は、まだ world ができていない
+  try { hasSeg = !!world.bh; } catch (e) { hasSeg = false; }
+  const left = (view.ox + 320 * view.s) / dpr, right = (view.ox + (hasSeg ? 734 : 950) * view.s) / dpr;
+  el.style.left = left + 'px'; el.style.width = Math.max(120, right - left) + 'px'; el.style.maxWidth = 'none';
+}
+addEventListener('resize', resize); resize();
+// 画面に見えている範囲(論理の座標)。盤面の外まで含む
+function visible() {
+  return { x0: -view.ox / view.s, y0: -view.oy / view.s, x1: (cv.width - view.ox) / view.s, y1: (cv.height - view.oy) / view.s };
+}
+// 1コマの描き始め: 画面全体を塗り、盤面の座標に切り替える
+function beginFrame(bg) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = bg; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(view.s, 0, 0, view.s, view.ox, view.oy);
+}
+// 画面全体(盤面の外も)を塗る
+function fillScreen(style) { const v = visible(); ctx.fillStyle = style; ctx.fillRect(v.x0, v.y0, v.x1 - v.x0, v.y1 - v.y0); }
+const C = { t0: '#4cc9f0', t1: '#f8961e', me: '#c77dff', wall: '#2a3245', wallTop: '#3a4560', spike: '#ef476f', goal: '#ffd166', fg: '#e8eaf0', dim: '#8a90a0' };
+const qs = new URLSearchParams(location.search);
+let world = createWorld(Math.max(0, Math.min(STAGES.length - 1, (Number(qs.get('stage')) || 1) - 1)));
+// 場面: 'title'(タイトル)・'game'・'ending'(面7のクリアの後)。?stage= を付けて開いた時は、すぐその面から
+let scene = qs.get('stage') ? 'game' : 'title';
+let endT = 0; // エンディングが始まってからの秒数
+let pullFx = []; // 面7の引力の黒い筋
+let fallFrom = null; // スタッフロールで、キャラクターが下へ落ち始めた時刻
+let deadTimer = 0;
+const keys = {};
+let jumpQueued = false, pressQueued = false;
+let typed = ''; // このコマで押された文字キー(面7の裏ゴール S → T → A → Y)
+let qeCounted = false; // Q/E を押し続けている間は、θ の操作を1回と数える
+let secretT = 0, trueEnd = false; // 面7の裏ゴールの文字を出してからの秒数(出し終えたらエンディングへ)
+
+// 見た裏ゴール(面の番号 1〜6)。ページを閉じても残す(残せないブラウザーでは、開いている間だけ覚える)
+const SECRET_KEY = 'dual-clocks.secrets';
+const seenSecrets = new Set((() => { try { return JSON.parse(localStorage.getItem(SECRET_KEY) || '[]'); } catch (e) { return []; } })());
+function rememberSecret(id) {
+  if (!id || seenSecrets.has(id)) return;
+  seenSecrets.add(id);
+  try { localStorage.setItem(SECRET_KEY, JSON.stringify([...seenSecrets])); } catch (e) { /* 保存できなくても続ける */ }
+}
+
+// TRUE END の報酬: 面7の裏ゴールのスタッフロールが始まった所から、キャラクターが金ぴかになる。ページを閉じても残す
+const GOLD_KEY = 'dual-clocks.gold';
+let gold = (() => { try { return localStorage.getItem(GOLD_KEY) === '1'; } catch (e) { return false; } })();
+let goldAt = null; // 金ぴかになった瞬間の endT(光の輪を広げる)
+function becomeGold() {
+  gold = true; goldAt = endT;
+  try { localStorage.setItem(GOLD_KEY, '1'); } catch (e) { /* 保存できなくても、開いている間は金ぴか */ }
+}
+// キャラクターの体を描く(金ぴかなら、斜めのグラデーションと光と、ときどき瞬く星)
+function drawBody(x, y, w, h) {
+  if (!gold) { ctx.fillStyle = C.me; roundRect(x, y, w, h, 6); ctx.fill(); return; }
+  const t = performance.now() / 1000;
+  const g = ctx.createLinearGradient(x, y, x + w, y + h);
+  g.addColorStop(0, '#fff6c8'); g.addColorStop(0.45, '#ffd166'); g.addColorStop(1, '#b8860b');
+  ctx.save();
+  ctx.shadowColor = 'rgba(255, 209, 102, 0.85)'; ctx.shadowBlur = 14;
+  ctx.fillStyle = g; roundRect(x, y, w, h, 6); ctx.fill();
+  ctx.shadowBlur = 0;
+  // 光の筋が体を斜めに横切る(2.4秒に1回)
+  const k = (t % 2.4) / 2.4 * 2 - 0.5;
+  ctx.clip(); ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.beginPath(); const sx = x + k * (w + h);
+  ctx.moveTo(sx, y); ctx.lineTo(sx + 6, y); ctx.lineTo(sx + 6 - h * 0.6, y + h); ctx.lineTo(sx - h * 0.6, y + h); ctx.fill();
+  ctx.restore();
+  // 瞬く星(4つの尖り)
+  ctx.save(); ctx.fillStyle = '#fffbe6';
+  for (let i = 0; i < 3; i++) {
+    const a = Math.sin(t * 2.2 + i * 2.1); if (a < 0.3) continue;
+    const sx2 = x + w / 2 + Math.cos(i * 2.4 + 1) * (w * 0.75), sy2 = y + h / 2 + Math.sin(i * 1.7 + 0.5) * (h * 0.7), r = 4.5 * a;
+    ctx.beginPath(); ctx.moveTo(sx2, sy2 - r); ctx.lineTo(sx2 + r * 0.25, sy2 - r * 0.25); ctx.lineTo(sx2 + r, sy2); ctx.lineTo(sx2 + r * 0.25, sy2 + r * 0.25);
+    ctx.lineTo(sx2, sy2 + r); ctx.lineTo(sx2 - r * 0.25, sy2 + r * 0.25); ctx.lineTo(sx2 - r, sy2); ctx.lineTo(sx2 - r * 0.25, sy2 - r * 0.25); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function load(i) {
+  world = createWorld(i); deadTimer = 0; secretT = 0; scene = 'game'; pullFx = []; showStage();
+  world.allSecrets = [1, 2, 3, 4, 5, 6].every(n => seenSecrets.has(n)); // 面7の裏ゴールの条件
+}
+world.allSecrets = [1, 2, 3, 4, 5, 6].every(n => seenSecrets.has(n)); // ?stage= で最初に開いた面にも
+function toTitle() { scene = 'title'; resetTitleMe(); showStage(); }
+// 面の名前と案内は、盤面に重ならないようキャンバスの外に出す
+function showStage() {
+  // タイトル画面(題名の枠に説明がある)とエンディングでは、上の帯は出さない
+  const t = scene === 'game' ? [world.name, world.hint] : ['', ''];
+  document.getElementById('sname').textContent = t[0];
+  document.getElementById('shint').textContent = t[1];
+  document.getElementById('stage').classList.toggle('empty', !t[0]);
+  document.getElementById('help').style.display = scene === 'game' ? '' : 'none'; // タイトルとスタッフロールでは、下の操作の説明は出さない
+  placeStageBar();
+}
+showStage();
+
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if ([' ', 'arrowup', 'arrowdown'].includes(k)) e.preventDefault();
+  if (!keys[k] && (k === 'w' || k === ' ')) jumpQueued = true;
+  keys[k] = true;
+  if (k === 'escape') { toTitle(); return; }
+  if (scene === 'ending') return;
+  if ('1234567'.includes(k) && k.length === 1) { load(Number(k) - 1); return; }
+  if (scene === 'title') { if (k === 'enter') { jumpQueued = false; load(0); } return; }
+  if (k === 'r') load(world.index);
+  if (k === 'n' && world.cleared && world.index < STAGES.length - 1) load(world.index + 1);
+  if (k === 's' && !keys.sHeld) pressQueued = true;
+  if (!e.repeat && /^[a-z]$/.test(k)) typed += k;
+  if (k === 's') keys.sHeld = true;
+});
+addEventListener('keyup', e => { const k = e.key.toLowerCase(); keys[k] = false; if (k === 's') keys.sHeld = false; });
+addEventListener('wheel', e => {
+  e.preventDefault();
+  // 上へ回すと t₁(縦の軸)の側へ。Shift で 0.5°(Shift を押すと横のスクロールになるブラウザーがあるので deltaX も見る)
+  const d = e.deltaY || e.deltaX;
+  const stepDeg = -(e.shiftKey ? 0.5 : 6) * Math.sign(d);
+  const tgt = scene === 'title' ? title : world; // タイトル画面でも時間を回せる
+  const before = tgt.thetaTarget;
+  tgt.thetaTarget = clampTheta(tgt.thetaTarget + stepDeg * Math.PI / 180);
+  if (tgt === world && scene === 'game' && !world.cleared && tgt.thetaTarget !== before) world.thetaOps++; // ホイールは1目盛りで1回
+
+}, { passive: false });
+function clampTheta(a) { return Math.max(0, Math.min(Math.PI / 2, a)); }
+
+// ---- 描画 ----
+// 描くためのマス。盤面より下の余りは、一番下の行を延ばす(床なら壁が続き、穴なら穴が続く。トゲの行は壁として)
+function viewTile(c, r) {
+  if (r < ROWS) return tileAt(world, c, r);
+  const ch = tileAt(world, c, ROWS - 1);
+  return (ch === '#' || ch === '^') ? '#' : '.';
+}
+function drawTiles() {
+  const v = visible();
+  const c0 = Math.floor(v.x0 / TS), c1 = Math.ceil(v.x1 / TS), r0 = Math.floor(v.y0 / TS), r1 = Math.ceil(v.y1 / TS);
+  for (let r = r0; r < r1; r++) for (let c = c0; c < c1; c++) {
+    const ch = viewTile(c, r), x = c * TS, y = r * TS;
+    if (ch === '#') {
+      ctx.fillStyle = C.wall; ctx.fillRect(x - 0.3, y - 0.3, TS + 0.6, TS + 0.6); // 少し重ねて、拡大した時の継ぎ目を消す
+      if (viewTile(c, r - 1) !== '#') { ctx.fillStyle = C.wallTop; ctx.fillRect(x, y, TS, 4); }
+    } else if (ch === '^') {
+      ctx.fillStyle = '#3a2030'; ctx.fillRect(x, y, TS, TS);
+      // 空いている側(下・上・左・右の順に探す)へ向けて描く
+      const open = (dc, dr) => '.Gb'.includes(tileAt(world, c + dc, r + dr));
+      const dir = open(0, 1) ? 'down' : open(0, -1) ? 'up' : open(-1, 0) ? 'left' : open(1, 0) ? 'right' : 'up';
+      ctx.fillStyle = C.spike; ctx.beginPath();
+      for (let i = 0; i < 4; i++) {
+        const k = i * 8;
+        if (dir === 'down') { ctx.moveTo(x + k, y + TS - 10); ctx.lineTo(x + k + 4, y + TS); ctx.lineTo(x + k + 8, y + TS - 10); }
+        else if (dir === 'up') { ctx.moveTo(x + k, y + 10); ctx.lineTo(x + k + 4, y); ctx.lineTo(x + k + 8, y + 10); }
+        else if (dir === 'left') { ctx.moveTo(x + 10, y + k); ctx.lineTo(x, y + k + 4); ctx.lineTo(x + 10, y + k + 8); }
+        else { ctx.moveTo(x + TS - 10, y + k); ctx.lineTo(x + TS, y + k + 4); ctx.lineTo(x + TS - 10, y + k + 8); }
+      }
+      ctx.fill();
+    } else if (ch === 'b') { // ボールだけを止める格子(プレイヤーは通れる)
+      ctx.strokeStyle = 'rgba(76,201,240,0.45)'; ctx.lineWidth = 1;
+      for (let i = 4; i < TS; i += 8) { ctx.beginPath(); ctx.moveTo(x + i, y); ctx.lineTo(x + i, y + TS); ctx.stroke(); }
+    } else if (ch === 'B') { // ボタン
+      ctx.fillStyle = '#ef476f'; roundRect(x + 3, y + TS - 10, TS - 6, 10, 3); ctx.fill();
+      ctx.fillStyle = '#ffd6de'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('S', x + TS / 2, y + TS - 13);
+    } else if (ch === 'T') { // 目標領域(面7)
+      ctx.fillStyle = 'rgba(6,214,160,0.10)'; ctx.fillRect(x, y, TS, TS);
+    } else if (ch === 'G') {
+      const a = 0.18 + 0.1 * Math.sin(performance.now() / 300);
+      ctx.fillStyle = `rgba(255, 209, 102, ${a})`; ctx.fillRect(x, y, TS, TS);
+      ctx.strokeStyle = C.goal; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, TS - 1, TS - 1);
+    }
+  }
+  // ゴールの文字
+  ctx.fillStyle = C.goal; ctx.font = 'bold 16px sans-serif'; ctx.textAlign = 'center';
+  let gx = 0, gy = 0, n = 0;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (world.grid[r][c] === 'G') { gx += c; gy += r; n++; }
+  if (n) ctx.fillText('G', (gx / n + 0.5) * TS, (gy / n + 0.5) * TS + 6);
+}
+
+// 時間の軸ごとの色。その軸の進みが遅いほど暗く(止まりかけ)
+function axisColor(axis, alpha) {
+  const t = axis === 0 ? world.t0 : world.t1;
+  const base = axis === 0 ? [76, 201, 240] : [248, 150, 30];
+  const k = 0.3 + 0.7 * t;
+  return `rgba(${base.map(v => Math.round(v * k)).join(',')}, ${alpha})`;
+}
+
+function drawLifts() {
+  for (const l of world.lifts) {
+    if (l.liss) { // 面7のリフト: 横は t₀、縦は t₁ の時計で動くので、両方の色
+      const g = ctx.createLinearGradient(l.x, 0, l.x + l.w, 0); g.addColorStop(0, axisColor(0, 1)); g.addColorStop(1, axisColor(1, 1));
+      ctx.fillStyle = g; ctx.fillRect(l.x, l.y, l.w, l.h); continue;
+    }
+    ctx.fillStyle = axisColor(l.axis, 1);
+    ctx.fillRect(l.x, l.y, l.w, l.h);
+    // 往復の範囲を薄く
+    ctx.strokeStyle = axisColor(l.axis, 0.25); ctx.setLineDash([4, 4]);
+    ctx.strokeRect(l.base.x - Math.abs(l.amp.x), l.base.y - Math.abs(l.amp.y), l.w + 2 * Math.abs(l.amp.x), l.h + 2 * Math.abs(l.amp.y));
+    ctx.setLineDash([]);
+    const t = l.axis === 0 ? world.t0 : world.t1;
+    ctx.fillStyle = '#0d1017'; ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText((l.axis === 0 ? 't₀' : 't₁') + (t < 0.05 ? ' 停止' : ''), l.x + l.w / 2, l.y + 12);
+  }
+}
+
+function arrow(x, y, vx, vy, color, scale, width) {
+  const ex = x + vx * scale, ey = y + vy * scale, len = Math.hypot(ex - x, ey - y);
+  if (len < 2) return;
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width;
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(ex, ey); ctx.stroke();
+  const a = Math.atan2(ey - y, ex - x);
+  ctx.beginPath(); ctx.moveTo(ex, ey);
+  ctx.lineTo(ex - 7 * Math.cos(a - 0.45), ey - 7 * Math.sin(a - 0.45));
+  ctx.lineTo(ex - 7 * Math.cos(a + 0.45), ey - 7 * Math.sin(a + 0.45));
+  ctx.closePath(); ctx.fill();
+}
+
+function drawSpike(b) {
+  // 止まっても見た目は変えない(色を変えたり輪を付けたりすると、触れても平気に見える)。止まったことは回転が止まるので分かる
+  const n = 10, rot = (world.T0 * 2) % (Math.PI * 2);
+  ctx.fillStyle = C.t0; ctx.beginPath(); // 止まっても色は変えない(白くすると、当たっても平気に見える)
+  for (let i = 0; i < n * 2; i++) {
+    const a = rot + i * Math.PI / n, rr = i % 2 ? b.r * 0.6 : b.r + 5;
+    ctx.lineTo(b.x + rr * Math.cos(a), b.y + rr * Math.sin(a));
+  }
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#0d1017'; ctx.beginPath(); ctx.arc(b.x, b.y, b.r * 0.45, 0, Math.PI * 2); ctx.fill();
+}
+function drawBalls() {
+  for (const b of world.balls) {
+    if (b.spike) continue; // トゲトゲボールは目盛りより手前に、最後に描く
+    // 時間の軸ごとに持っている速度(凍っていても残っている)
+    arrow(b.x, b.y, b.v0.x, b.v0.y, 'rgba(76,201,240,0.85)', 0.25, 2);
+    arrow(b.x, b.y, b.v1.x, b.v1.y, 'rgba(248,150,30,0.85)', 0.25, 2);
+    const g = ctx.createLinearGradient(b.x - b.r, b.y, b.x + b.r, b.y);
+    g.addColorStop(0, C.t0); g.addColorStop(1, C.t1);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+    const v = observed(b, world.t0, world.t1);
+    arrow(b.x, b.y, v.x, v.y, 'rgba(255,255,255,0.9)', 0.25, 1);
+  }
+}
+
+function drawMovers() {
+  for (const m of world.movers) {
+    const g = ctx.createLinearGradient(m.x, 0, m.x + m.w, 0);
+    g.addColorStop(0, axisColor(0, 1)); g.addColorStop(1, axisColor(1, 1));
+    ctx.fillStyle = g; ctx.fillRect(m.x, m.y, m.w, m.h);
+    const v = observed(m, world.t0, world.t1);
+    arrow(m.x + m.w / 2, m.y + m.h / 2, v.x, v.y, '#fff', 0.35, 2);
+  }
+}
+
+// 面5: 鳥と、今の見かけの重力の向き
+function drawBird() {
+  const b = world.bird; if (!b) return;
+  const gy = world.t0 * world.t0 * b.a0.y + world.t1 * world.t1 * b.a1.y; // 見かけの加速度 = g·(t₀² − t₁²)
+  arrow(b.x, b.y, 0, gy, gy >= 0 ? C.t0 : C.t1, 0.08, 2);
+  ctx.fillStyle = C.goal; ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#0d1017'; ctx.beginPath(); ctx.arc(b.x + 4, b.y - 3, 2.2, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#f8961e'; ctx.beginPath(); ctx.moveTo(b.x + b.r - 1, b.y - 2); ctx.lineTo(b.x + b.r + 6, b.y + 1); ctx.lineTo(b.x + b.r - 1, b.y + 3); ctx.fill();
+  const vy = world.t0 * b.v0.y + world.t1 * b.v1.y, flapUp = vy < -100;
+  ctx.fillStyle = '#fff3c4'; ctx.beginPath(); ctx.ellipse(b.x - 3, b.y + (flapUp ? -4 : 3), 6, 3.5, flapUp ? -0.5 : 0.4, 0, Math.PI * 2); ctx.fill();
+}
+// 面6: 目標の軌道(金の点線)・描いた軌道(合っている間は白、外れたら赤)・ボール
+function drawLiss() {
+  const L = world.liss; if (!L) return;
+  ctx.strokeStyle = 'rgba(255,209,102,0.7)'; ctx.lineWidth = 2; ctx.setLineDash([5, 5]); ctx.beginPath();
+  L.target.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.closePath(); ctx.stroke(); ctx.setLineDash([]);
+  if (!L.active) return;
+  ctx.strokeStyle = L.bad ? '#ef476f' : 'rgba(255,255,255,0.9)'; ctx.lineWidth = 2; ctx.beginPath();
+  L.trace.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.lineTo(L.x, L.y); ctx.stroke();
+  const g = ctx.createLinearGradient(L.x - 9, L.y, L.x + 9, L.y); g.addColorStop(0, C.t0); g.addColorStop(1, C.t1);
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(L.x, L.y, 9, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = C.dim; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(L.bad ? '外れた(S でやり直し)' : `重なった所 ${Math.round(L.coveredCount / L.target.length * 100)}%`, L.cx, L.cy + L.B + 30);
+}
+// 面7: 当たり板・箱・ブラックホール・カウンター
+function drawStage7Back() {
+  if (!world.bh) return;
+  for (const st of world.stoppers) { ctx.fillStyle = C.wall; ctx.fillRect(st.x, st.y, st.w, st.h); ctx.fillStyle = C.wallTop; ctx.fillRect(st.x, st.y + st.h - 3, st.w, 3); }
+  for (const b of world.boxes) {
+    ctx.globalAlpha = b.fade ? Math.max(0, 1 - b.fade) : 1; // 長く残った箱はゆっくり消えていく
+    ctx.fillStyle = '#b5835a'; ctx.fillRect(b.x - b.r, b.y - b.r, 2 * b.r, 2 * b.r);
+    ctx.strokeStyle = '#6b4a2f'; ctx.lineWidth = 1.5; ctx.strokeRect(b.x - b.r + 0.5, b.y - b.r + 0.5, 2 * b.r - 1, 2 * b.r - 1);
+  }
+  ctx.globalAlpha = 1;
+  const B = world.bh, now = performance.now() / 1000, p = world.player;
+  // 引力の演出: 近づくほど、ブラックホールの周りが暗く広がり、あなたからブラックホールへ黒い筋が流れ込む
+  const pd = Math.hypot(p.x + p.w / 2 - B.x, p.y + p.h / 2 - B.y);
+  const near = p.trapped ? 1 : Math.max(0, 1 - pd / B.pullR);
+  if (near > 0) {
+    const shadow = ctx.createRadialGradient(B.x, B.y, B.rs, B.x, B.y, B.rs + 40 + near * 220);
+    shadow.addColorStop(0, `rgba(0,0,0,${0.55 + 0.35 * near})`); shadow.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = shadow; ctx.beginPath(); ctx.arc(B.x, B.y, B.rs + 40 + near * 220, 0, Math.PI * 2); ctx.fill();
+    if (!p.trapped) for (let i = 0; i < near * near * 8; i++) pullFx.push({ x: p.x + p.w / 2 + (Math.random() - 0.5) * 60, y: p.y + p.h / 2 + (Math.random() - 0.5) * 50, v: 40 + Math.random() * 60, life: 1 });
+  }
+  for (let i = pullFx.length - 1; i >= 0; i--) {
+    const f = pullFx[i], dx = B.x - f.x, dy = B.y - f.y, d = Math.hypot(dx, dy);
+    f.v += 900 / Math.max(20, d) * 6; const step = Math.min(d, f.v / 60);
+    const ox = f.x, oy = f.y; f.x += dx / d * step; f.y += dy / d * step;
+    // 黒い筋。暗い背景でも見えるよう、薄い紫で縁取る
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(170,150,255,0.35)'; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(ox - dx / d * 12, oy - dy / d * 12); ctx.lineTo(f.x, f.y); ctx.stroke();
+    ctx.strokeStyle = 'rgba(0,0,0,0.95)'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(ox - dx / d * 12, oy - dy / d * 12); ctx.lineTo(f.x, f.y); ctx.stroke();
+    ctx.lineCap = 'butt';
+    if (d < B.rs || f.v > 2000) pullFx.splice(i, 1);
+  }
+  if (pullFx.length > 400) pullFx.splice(0, pullFx.length - 400);
+  const glow = ctx.createRadialGradient(B.x, B.y, B.rs * 0.8, B.x, B.y, B.rs * 2.6);
+  glow.addColorStop(0, 'rgba(255,120,60,0.55)'); glow.addColorStop(1, 'rgba(255,60,30,0)');
+  ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(B.x, B.y, B.rs * 2.6, 0, Math.PI * 2); ctx.fill();
+  // 外から見ると、中は赤っぽい
+  const core = ctx.createRadialGradient(B.x, B.y, 0, B.x, B.y, B.rs);
+  core.addColorStop(0, '#5a0010'); core.addColorStop(0.7, '#25000a'); core.addColorStop(1, '#000');
+  ctx.fillStyle = core; ctx.beginPath(); ctx.arc(B.x, B.y, B.rs, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = `rgba(255,170,90,${0.5 + 0.2 * Math.sin(now * 3)})`; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.ellipse(B.x, B.y, B.rs * 1.9, B.rs * 0.5, -0.25, 0, Math.PI * 2); ctx.stroke();
+}
+// 7セグメントの数字(4桁)
+const SEG = { 0: 'abcdef', 1: 'bc', 2: 'abged', 3: 'abgcd', 4: 'fgbc', 5: 'afgcd', 6: 'afgedc', 7: 'abc', 8: 'abcdefg', 9: 'abcdfg' };
+function draw7seg(str, x, y, w, h, on, off) {
+  const t = Math.max(3, w * 0.16);
+  const segs = { a: [t, 0, w - 2 * t, t], b: [w - t, t, t, h / 2 - 1.5 * t], c: [w - t, h / 2 + 0.5 * t, t, h / 2 - 1.5 * t],
+    d: [t, h - t, w - 2 * t, t], e: [0, h / 2 + 0.5 * t, t, h / 2 - 1.5 * t], f: [0, t, t, h / 2 - 1.5 * t], g: [t, h / 2 - t / 2, w - 2 * t, t] };
+  [...str].forEach((ch, i) => {
+    const ox = x + i * (w + w * 0.35);
+    for (const k of 'abcdefg') { const r = segs[k]; ctx.fillStyle = (SEG[ch] || '').includes(k) ? on : off; ctx.fillRect(ox + r[0], y + r[1], r[2], r[3]); }
+  });
+}
+function drawStage7Front() {
+  if (!world.bh) return;
+  // あなたの所での外の時間の速さだけ、外の光は青く見える(青方偏移)
+  if (world.k > 1.001) { // 外の時間が速いほど、だんだん青く
+    const a = Math.min(0.45, 0.45 * (world.k - 1) / (world.bh.kMax - 1));
+    fillScreen(`rgba(60,120,255,${a})`);
+  }
+  const shown = scene === 'ending' ? endingCounter() : String(Math.min(9999, world.count)).padStart(4, '0');
+  ctx.fillStyle = 'rgba(13,16,23,0.8)'; roundRect(744, 10, 206, 70, 8); ctx.fill();
+  draw7seg(shown, 760, 20, 30, 50, '#ff3b3b', 'rgba(255,59,59,0.10)');
+  // 外の時間の速さは、7セグの下に(上の帯と重ならないように)
+  ctx.fillStyle = C.dim; ctx.font = '12px sans-serif'; ctx.textAlign = 'right';
+  ctx.fillText(`外の時間 ×${world.k < 10 ? world.k.toFixed(2) : Math.round(world.k)}  外の時計 ${Math.round(world.outside)}s`, 944, 96);
+}
+function drawPlayer() {
+  if (world.noPlayer) return;
+  const p = world.player;
+  drawBody(p.x, p.y, p.w, p.h);
+  ctx.fillStyle = '#fff';
+  const ex = p.x + p.w / 2 + p.facing * 4;
+  ctx.fillRect(ex - 6, p.y + 8, 4, 6); ctx.fillRect(ex + 2, p.y + 8, 4, 6);
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+// θ の目盛り(四分円)。横が t₀ の軸、縦が t₁ の軸
+function drawDial(src = world) { // src: ゲームの世界か、タイトル画面の状態
+  const cx = 24, cy = 132, R = 92;
+  ctx.fillStyle = 'rgba(13,16,23,0.6)'; roundRect(10, 10, 300, 136, 8); ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = C.t0; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + R, cy); ctx.stroke();
+  ctx.strokeStyle = C.t1; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx, cy - R); ctx.stroke();
+  ctx.strokeStyle = '#3a4560'; ctx.beginPath(); ctx.arc(cx, cy, R, -Math.PI / 2, 0); ctx.stroke();
+  // 目標の角度(薄く)と今の角度
+  const tg = src.thetaTarget;
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + R * Math.cos(tg), cy - R * Math.sin(tg)); ctx.stroke();
+  const th = src.theta, nx = cx + R * Math.cos(th), ny = cy - R * Math.sin(th);
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(nx, ny); ctx.stroke();
+  // 影(t₀・t₁ の値)
+  ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+  ctx.strokeStyle = C.t0; ctx.beginPath(); ctx.moveTo(nx, ny); ctx.lineTo(nx, cy); ctx.stroke();
+  ctx.strokeStyle = C.t1; ctx.beginPath(); ctx.moveTo(nx, ny); ctx.lineTo(cx, ny); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(nx, ny, 4, 0, Math.PI * 2); ctx.fill();
+  // 数字
+  ctx.textAlign = 'left'; ctx.font = '14px sans-serif';
+  ctx.fillStyle = C.fg; ctx.fillText(`θ = ${(th * 180 / Math.PI).toFixed(src.liss ? 1 : 0)}°`, 136, 34);
+  ctx.fillStyle = C.t0; ctx.fillText(`t₀ = ${src.t0.toFixed(2)}`, 136, 58);
+  ctx.fillStyle = C.t1; ctx.fillText(`t₁ = ${src.t1.toFixed(2)}`, 136, 80);
+  ctx.font = '12px sans-serif'; ctx.fillStyle = C.dim;
+  ctx.fillText(`時計 T₀ ${src.T0.toFixed(1)}s  T₁ ${src.T1.toFixed(1)}s`, 136, 104);
+  ctx.fillText(src.started ? 'あなたの時間は独立' : (src.bird ? '羽ばたくと始まる' : '動くと時間が流れ始める'), 136, 124);
+}
+
+function drawText() {
+  if (world.cleared && world.bh) { if (world.secret === 7) banner(world.clearText, ''); return; } // 面7のクリアはエンディングへ(裏ゴールだけ文字を見せる)
+  if (world.cleared) banner(world.clearText || 'クリア!', 'N で次の面へ'); // clearText: 2面の裏ゴールなど
+  else if (world.dead) banner(world.dead, 'やり直します');
+}
+function banner(big, small) {
+  ctx.fillStyle = 'rgba(13,16,23,0.8)'; ctx.fillRect(0, 236, 960, 104);
+  ctx.textAlign = 'center'; ctx.fillStyle = C.fg; ctx.font = 'bold 34px sans-serif'; ctx.fillText(big, 480, small ? 286 : 300); // 下の行が無い時は帯の真ん中に
+  ctx.font = '15px sans-serif'; ctx.fillStyle = C.dim; ctx.fillText(small, 480, 318);
+}
+
+// ---- ループ ----
+// ---- タイトル画面: 物が跳ねていて、ホイールで時間を回せる ----
+const title = { theta: 0, thetaTarget: Math.PI / 4, t0: Math.SQRT1_2, t1: Math.SQRT1_2, T0: 0, T1: 0, started: true, things: [] };
+(function makeTitleThings() {
+  const kinds = ['ball', 'spike', 'box', 'bird'];
+  for (let i = 0; i < 14; i++) {
+    // 初速は t₀ か t₁ のどちらか一方の世界にだけ持たせる(θ を端に回すと、半分の物が止まる)
+    const a = Math.random() * Math.PI * 2, sp = 90 + Math.random() * 160, v = { x: Math.cos(a) * sp, y: Math.sin(a) * sp };
+    const onT0 = i % 2 === 0;
+    title.things.push({ kind: kinds[i % 4], x: 60 + Math.random() * 840, y: 60 + Math.random() * 400, r: 10 + Math.random() * 6,
+      v0: onT0 ? v : { x: 0, y: 0 }, v1: onT0 ? { x: 0, y: 0 } : v });
+  }
+})();
+// タイトル画面のキャラクター: 上から降ってきて、A / D・W / スペースで動かせる(独立した時間なので θ に関係ない)
+const titleMe = { x: 468, y: -60, vx: 0, vy: 0, w: 24, h: 28, onFloor: false, facing: 1 };
+function resetTitleMe() { Object.assign(titleMe, { x: 468, y: -60, vx: 0, vy: 0, onFloor: false }); }
+function stepTitleMe(dt) {
+  const m = titleMe, floor = VH - 16, v = visible();
+  const dir = (keys['d'] ? 1 : 0) - (keys['a'] ? 1 : 0);
+  if (dir) { m.vx = Math.max(-260, Math.min(260, m.vx + dir * 2400 * dt)); m.facing = dir; }
+  else { const f = 2600 * dt; m.vx = Math.abs(m.vx) <= f ? 0 : m.vx - Math.sign(m.vx) * f; }
+  if ((jumpQueued || keys['w'] || keys[' ']) && m.onFloor) { m.vy = -620; m.onFloor = false; }
+  jumpQueued = false;
+  m.vy = Math.min(m.vy + 1800 * dt, 1400);
+  m.x = Math.max(v.x0, Math.min(v.x1 - m.w, m.x + m.vx * dt)); m.y += m.vy * dt;
+  m.onFloor = false;
+  if (m.y + m.h >= floor) { m.y = floor - m.h; m.vy = 0; m.onFloor = true; }
+}
+function drawMe(x, y, facing) {
+  drawBody(x, y, 24, 28);
+  ctx.fillStyle = '#fff'; const ex = x + 12 + facing * 4; ctx.fillRect(ex - 6, y + 8, 4, 6); ctx.fillRect(ex + 2, y + 8, 4, 6);
+}
+function stepTitle(dt) {
+  stepTitleMe(dt);
+  title.theta += (title.thetaTarget - title.theta) * Math.min(1, dt * 12);
+  title.t0 = Math.cos(title.theta); title.t1 = Math.sin(title.theta);
+  title.T0 += title.t0 * dt; title.T1 += title.t1 * dt;
+  for (const o of title.things) {
+    const v = observed(o, title.t0, title.t1);
+    o.x += v.x * dt; o.y += v.y * dt;
+    // 画面の端で跳ね返る。壁に向かっていた軸の速度だけを返す(ゲームの中と同じ決まり)
+    const vis = visible();
+    for (const [axis, lo, hi] of [['x', vis.x0 + o.r, vis.x1 - o.r], ['y', vis.y0 + o.r + 40, VH - 16 - o.r]]) {
+      const dir = o[axis] < lo ? 1 : o[axis] > hi ? -1 : 0;
+      if (!dir) continue;
+      o[axis] = dir > 0 ? lo : hi;
+      for (const vv of [o.v0, o.v1]) if (vv[axis] * dir < 0) vv[axis] = -vv[axis];
+    }
+  }
+}
+// 題名のロゴ: Dual は t₀ の水色、Clocks は t₁ のオレンジ(時間の軸と同じ色)。グラデーション・光・流れる光沢(縁取りは無し)
+function drawTitleLogo(cx, base) {
+  const now = performance.now() / 1000;
+  ctx.save();
+  ctx.font = '800 64px "Segoe UI", "Hiragino Sans", sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  const gap = 18, wD = ctx.measureText('Dual').width, wC = ctx.measureText('Clocks').width;
+  const x0 = cx - (wD + gap + wC) / 2, x1 = x0 + wD + gap;
+  const word = (text, x, top, bottom, glow) => {
+    // 光(グロー)
+    ctx.shadowColor = glow; ctx.shadowBlur = 22 + 6 * Math.sin(now * 2);
+    const g = ctx.createLinearGradient(0, base - 52, 0, base + 6); g.addColorStop(0, top); g.addColorStop(1, bottom);
+    ctx.fillStyle = g; ctx.fillText(text, x, base);
+    ctx.shadowBlur = 0;
+  };
+  word('Dual', x0, '#c9f3ff', C.t0, 'rgba(76,201,240,0.85)');
+  word('Clocks', x1, '#ffe2b0', C.t1, 'rgba(248,150,30,0.85)');
+  ctx.restore(); ctx.save();
+  // 流れる光沢: 文字だけの別の層を作り、文字の形の中にだけ白い帯をゆっくり通して重ねる
+  const sx = x0 - 120 + ((now * 160) % (wD + gap + wC + 360));
+  const off = titleLogoLayer || (titleLogoLayer = document.createElement('canvas'));
+  off.width = VW; off.height = 90;
+  const o = off.getContext('2d');
+  o.font = '800 64px "Segoe UI", "Hiragino Sans", sans-serif'; o.textBaseline = 'alphabetic';
+  o.fillStyle = '#fff'; o.fillText('Dual', x0, 70); o.fillText('Clocks', x1, 70);
+  o.globalCompositeOperation = 'source-in';
+  const sh2 = o.createLinearGradient(sx - 40, 0, sx + 40, 0);
+  sh2.addColorStop(0, 'rgba(255,255,255,0)'); sh2.addColorStop(0.5, 'rgba(255,255,255,0.6)'); sh2.addColorStop(1, 'rgba(255,255,255,0)');
+  o.fillStyle = sh2; o.fillRect(0, 0, off.width, off.height);
+  ctx.drawImage(off, 0, base - 70);
+  ctx.restore();
+}
+let titleLogoLayer = null;
+function drawTitle() {
+  beginFrame('#121722');
+  for (const o of title.things) {
+    if (o.kind === 'spike') drawSpike({ x: o.x, y: o.y, r: o.r });
+    else if (o.kind === 'box') { ctx.fillStyle = '#b5835a'; ctx.fillRect(o.x - o.r, o.y - o.r, 2 * o.r, 2 * o.r); }
+    else if (o.kind === 'bird') { ctx.fillStyle = C.goal; ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#0d1017'; ctx.beginPath(); ctx.arc(o.x + 4, o.y - 3, 2.2, 0, Math.PI * 2); ctx.fill(); }
+    else { const g = ctx.createLinearGradient(o.x - o.r, o.y, o.x + o.r, o.y); g.addColorStop(0, C.t0); g.addColorStop(1, C.t1); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2); ctx.fill(); }
+    arrow(o.x, o.y, o.v0.x, o.v0.y, 'rgba(76,201,240,0.5)', 0.15, 1.5);
+    arrow(o.x, o.y, o.v1.x, o.v1.y, 'rgba(248,150,30,0.5)', 0.15, 1.5);
+  }
+  { const v = visible(); ctx.fillStyle = 'rgba(42,50,69,0.9)'; ctx.fillRect(v.x0, VH - 16, v.x1 - v.x0, v.y1 - VH + 16); } // タイトルの床
+  drawMe(titleMe.x, titleMe.y, titleMe.facing);
+  ctx.fillStyle = 'rgba(13,16,23,0.7)'; roundRect(200, 150, 560, 240, 14); ctx.fill();
+  drawTitleLogo(480, 252);
+  ctx.textAlign = 'center';
+  ctx.font = '15px sans-serif'; ctx.fillStyle = C.dim;
+  ctx.font = '15px sans-serif';
+  ctx.fillStyle = C.fg; ctx.fillText('Enter で始める ・ 1〜7 で面を選ぶ', 480, 322);
+  ctx.fillText('A / D で移動、Space でジャンプ', 480, 344);
+  ctx.fillStyle = C.dim; ctx.fillText('マウスホイールで時間(θ)を回せる。水色の矢印は t₀、オレンジは t₁ の世界の速度', 480, 366);
+  drawDial(title); // 左上の計器はタイトル画面でも出す
+}
+
+// ---- エンディング(面7のクリアの後) ----
+// 0〜2秒: カウンターだけが回る(リフトと箱は動き続けて加速)。2〜9秒: 世界がデジタルノイズにまみれ、7〜10秒で真っ暗になる。
+// 10秒〜: キャラクターが落ちていく。12秒〜: スタッフロール。終わるとタイトルへ。Esc で飛ばせる
+const CREDITS = [
+  ['Dual Clocks', ''], ['', ''],
+  ['企画', 'aidasquid'], ['プロデューサー', 'aidasquid'], ['レベルデザイン', 'aidasquid'], ['', ''],
+  // ここからスペシャルサンクスの前までは空行を挟まずに詰める
+  ['ディレクター', 'Claude Code'], ['アートディレクター', 'Claude Code'], ['ゲームデザイン', 'Claude Code'],
+  ['リードプログラマー', 'Claude Code'], ['物理プログラム', 'Claude Code'], ['グラフィックプログラム', 'Claude Code'],
+  ['キャラクターデザイン', 'Claude Code'], ['アニメーター', 'Claude Code'], ['UIデザイン', 'Claude Code'], ['エフェクト', 'Claude Code'],
+  ['品質保証', 'Claude Code'], ['テスター', 'Claude Code'], ['ダメ出し係', 'aidasquid'],
+  ['テスト自動化', 'Claude Code'], ['ゲームバランス調整', 'Claude Code'], ['ツール開発', 'Claude Code'], ['デバッグ', 'Claude Code'],
+  ['開発ボトルネック', 'aidasquid'], ['ドキュメント', 'Claude Code'], ['プロジェクト管理', 'Claude Code'], ['', ''],
+  ['スペシャルサンクス', '遊んでくれたあなた'], ['', ''], ['', ''],
+  ['Thank you for playing', ''],
+];
+const CREDIT_LINE = 46, CREDIT_SPEED = 42; // 行の間隔(px)と流れる速さ(px/秒)
+const END_GAP = 2; // クリアしてから、ノイズが走り始めるまでの間(秒)。その間はカウンターだけが回る
+function creditsEnd() { return END_GAP + 10 + (CREDITS.length * CREDIT_LINE + VH) / CREDIT_SPEED; }
+function endingCounter() { // 9999 を超えても回り続け、だんだん数字が崩れる
+  if (endT < 2) return String(world.count + Math.floor(endT * endT * 2500)).padStart(4, '0').slice(-4);
+  return Array.from({ length: 4 }, () => Math.floor(Math.random() * 10)).join('');
+}
+const fallStreaks = Array.from({ length: 90 }, () => ({ x: Math.random() * 1400 - 220, y: Math.random() * 576, l: 20 + Math.random() * 80 }));
+function drawEnding(dt) {
+  const e = endT - END_GAP; // ノイズ以降の時刻
+  if (e < 8) {
+    stepOutsideFast(world, dt, Math.min(400, 12 * Math.pow(1.8, endT))); // 外の世界は止めずに、どんどん速く
+    drawGameScene();
+    // デジタルノイズ: 横の帯をずらし、色の四角を散らす。時間とともに増える
+    const n = e > 0 ? Math.floor(e * e * 6) : 0;
+    for (let i = 0; i < Math.min(n, 40); i++) {
+      // 帯のずらしは画面の画素で行う(盤面の座標の変換を一度外す)
+      const y = Math.random() * cv.height, hh = (2 + Math.random() * 18) * view.s, off = (Math.random() - 0.5) * e * 40 * view.s;
+      ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(cv, 0, y, cv.width, hh, off, y, cv.width, hh); ctx.restore();
+    }
+    for (let i = 0; i < n; i++) {
+      ctx.fillStyle = ['#ff3b3b', '#4cc9f0', '#f8961e', '#fff', '#06d6a0'][i % 5];
+      ctx.globalAlpha = 0.25 + Math.random() * 0.5;
+      const v = visible(); ctx.fillRect(v.x0 + Math.random() * (v.x1 - v.x0), v.y0 + Math.random() * (v.y1 - v.y0), 4 + Math.random() * 40, 2 + Math.random() * 8);
+    }
+    ctx.globalAlpha = 1;
+    if (e > 5) fillScreen(`rgba(0,0,0,${Math.min(1, (e - 5) / 3)})`);
+    return;
+  }
+  // 何もない真っ暗な場所を、キャラクターが落ちていく
+  beginFrame('#000');
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 1;
+  for (const s of fallStreaks) {
+    const v = visible();
+    s.y -= 260 * dt; if (s.y + s.l < v.y0) { s.y = v.y1 + Math.random() * 100; s.x = v.x0 + Math.random() * (v.x1 - v.x0); }
+    ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(s.x, s.y + s.l); ctx.stroke();
+  }
+  // 「Thank you for playing」が画面の下から7割ほど上がったら、キャラクターは下へ見切れていく
+  const thanksY = VH - (e - 10) * CREDIT_SPEED + (CREDITS.length - 1) * CREDIT_LINE;
+  if (e >= 10 && thanksY < VH * 0.3 && fallFrom === null) fallFrom = e;
+  // 見ている側(カメラ)がもう上から下へ追っているので、加速させずに等速で下へ抜けていく
+  const drop = fallFrom === null ? 0 : 160 * (e - fallFrom);
+  const px = e < 10 ? 480 : 160, py = 250 + Math.sin(endT * 1.3) * 8 + drop;
+  if (trueEnd && e >= 10 && !gold) becomeGold(); // TRUE END: スタッフロールが始まった所で金ぴかに
+  if (goldAt !== null && endT - goldAt < 1.2) { // 金ぴかになった瞬間の光の輪
+    const q = (endT - goldAt) / 1.2;
+    ctx.save(); ctx.strokeStyle = `rgba(255, 209, 102, ${1 - q})`; ctx.lineWidth = 6 * (1 - q) + 1;
+    ctx.beginPath(); ctx.arc(px, py, 20 + 160 * q, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = `rgba(255, 246, 200, ${0.5 * (1 - q)})`; ctx.beginPath(); ctx.arc(px, py, 30 + 40 * q, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+  ctx.save(); ctx.translate(px, py); ctx.rotate(Math.sin(endT * 0.7) * 0.4);
+  drawBody(-12, -14, 24, 28);
+  ctx.fillStyle = '#fff'; ctx.fillRect(-6, -6, 4, 6); ctx.fillRect(2, -6, 4, 6);
+  ctx.restore();
+  if (e >= 10) { // スタッフロール
+    const base = VH - (e - 10) * CREDIT_SPEED;
+    CREDITS.forEach(([role, name], i) => {
+      const y = base + i * CREDIT_LINE;
+      if (y < -20 || y > VH + 20) return;
+      if (!name) { ctx.textAlign = 'center'; ctx.fillStyle = C.fg; ctx.font = 'bold 22px sans-serif'; ctx.fillText(role, 600, y); return; }
+      ctx.textAlign = 'right'; ctx.fillStyle = C.dim; ctx.font = '15px sans-serif'; ctx.fillText(role, 580, y);
+      ctx.textAlign = 'left'; ctx.fillStyle = C.fg; ctx.font = '17px sans-serif'; ctx.fillText(name, 610, y);
+    });
+  }
+}
+
+function drawGameScene() {
+  beginFrame('#121722');
+  drawTiles(); drawLiss(); drawStage7Back(); drawLifts(); drawMovers(); drawBalls(); drawPlayer(); drawDial();
+  for (const b of world.balls) if (b.spike) drawSpike(b); // 危ない物と鳥は、目盛りに隠れないよう手前に
+  drawBird();
+  drawStage7Front();
+  drawText();
+  if (world.fade > 0) fillScreen(`rgba(0,0,0,${world.fade})`); // 面7: 中心で数が増えない時の暗転
+}
+
+// ---- ループ ----
+let last = performance.now();
+function frame(now) {
+  let dt = Math.max(0, Math.min(0.05, (now - last) / 1000)); last = now; // 最初のコマは now が last より前のことがある
+  const qe = (keys['e'] ? 1 : 0) - (keys['q'] ? 1 : 0);
+  const qeRate = keys['shift'] ? 10 : 180; // 1秒あたりの度。普段は0°→90°が0.5秒、Shift で細かく
+  if (scene === 'title') {
+    if (qe) title.thetaTarget = clampTheta(title.thetaTarget + qe * (qeRate * Math.PI / 180) * dt);
+    stepTitle(dt); drawTitle();
+    requestAnimationFrame(frame); return;
+  }
+  if (scene === 'ending') {
+    endT += dt; drawEnding(dt);
+    if (endT > creditsEnd()) toTitle();
+    requestAnimationFrame(frame); return;
+  }
+  if (qe) {
+    const before = world.thetaTarget;
+    world.thetaTarget = clampTheta(world.thetaTarget + qe * (qeRate * Math.PI / 180) * dt);
+    if (!qeCounted && !world.cleared && world.thetaTarget !== before) { world.thetaOps++; qeCounted = true; } // 押してから離すまでで1回
+  } else qeCounted = false;
+  const sub = 4, h = dt / sub;
+  for (let i = 0; i < sub; i++) {
+    const input = { left: !!keys['a'], right: !!keys['d'], jump: jumpQueued || !!keys['w'] || !!keys[' '],
+      flap: jumpQueued, press: pressQueued, typed };
+    // θ を回しただけでも時間は流れ始める(鳥の面だけは、最初の羽ばたきまで待つ)
+    if (!world.started && !world.bird && (qe || world.thetaTarget !== 0)) world.started = true;
+    step(world, h, input);
+    jumpQueued = false; pressQueued = false; typed = '';
+  }
+  typed = '';
+  if (world.cleared) rememberSecret(world.secret <= 6 ? world.secret : 0);
+  if (world.dead) { deadTimer += dt; if (deadTimer > 0.9) load(world.index); }
+  if (world.cleared && world.secret === 7) secretT += dt; // 面7の裏ゴールは、文字を見せてからエンディングへ
+  if (world.cleared && world.bh && (world.secret !== 7 || secretT > 3.5)) { scene = 'ending'; endT = 0; fallFrom = null; trueEnd = world.secret === 7; goldAt = null; showStage(); } // 面7のクリアは特別な演出へ
+  if (world.retry) { load(world.index); } // 中心で数が増えず暗転しきったら、何も言わずにやり直す
+  drawGameScene();
+  requestAnimationFrame(frame);
+}
+showStage();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
