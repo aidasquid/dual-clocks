@@ -285,6 +285,8 @@
     for (const m of w.movers) if (overlaps(rect, m)) list.push({ x: m.x, y: m.y, w: m.w, h: m.h, ref: m });
     for (const st of w.stoppers || []) if (overlaps(rect, st)) list.push({ ...st, ref: null });
     // ボール(トゲトゲボールは除く)は、プレイヤーにとって固い物(めり込めない・上に乗れる)。押すと力がかかる(stepBalls)
+    // 上に乗った人の重さは、ボールに伝えない。物理としては抜けだが、宙を進むボールに乗って運ばれる動き(面2の裏ゴール)が
+    // 面白いので、この作品ではわざと残している
     for (const b of w.balls) if (!b.spike) {
       const r = { x: b.x - b.r, y: b.y - b.r, w: 2 * b.r, h: 2 * b.r };
       if (overlaps(rect, r)) list.push({ ...r, ref: null, ball: b });
